@@ -1,6 +1,7 @@
-package device
+package devices
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -54,8 +55,11 @@ func ListDeviceNames(printDescription bool, printIP bool) ([]string, error) {
 // FindDeviceByName returns the device with the provided name.
 func FindDeviceByName(name string) (string, error) {
 	if name == "" {
-		// RIP non-Linux
-		return "any", nil
+		if deviceAnySupported {
+			return "any", nil
+		}
+
+		return "", errors.New("No device name given")
 	}
 
 	device := ""
@@ -63,7 +67,7 @@ func FindDeviceByName(name string) (string, error) {
 	if index, err := strconv.Atoi(name); err == nil {
 		devices, err := ListDeviceNames(false, false)
 		if err != nil {
-			return "", fmt.Errorf("Error building device list: %s", err)
+			return "", fmt.Errorf("Error building device list: %w", err)
 		}
 
 		if index >= len(devices) {

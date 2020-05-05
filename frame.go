@@ -1,97 +1,119 @@
+//lint:file-ignore U1000 Ignore unused struct members as they're part of the payload and users may want them
 package zanarkand
 
 import (
 	"bufio"
-	"bytes"
-	"compress/zlib"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"time"
+
+	"github.com/google/gopacket"
 )
 
 var frameHeaderLength = 40
-
 var frameMagicLE uint64 = 0xE2465DFF41A05252
 
-// FrameHeader is the metadata around an FFXIV frame.
-// Currently, bytes 4:7, 8:15, 32, and 34:39 are unknown.
-type FrameHeader struct {
-	Magic      uint64    // [0:8] - mainly to verify magic bytes
-	Timestamp  time.Time // [16:23] - timestamp in milliseconds since epoch
-	Length     uint32    // [24:27]
-	Connection uint16    // [28:29] - 0 lobby, 1 zone, 2 chat
-	Count      uint16    // [30:31]
-	Compressed bool      // [33] UINT8 bool tho
-}
+// FrameIngress is an inbound Frame.
+// FrameEgress is an outbound Frame.
+const (
+	FrameIngress FlowDirection = 1
+	FrameEgress  FlowDirection = 2
+)
+
+// FlowDirection indicates the flow being inbound or outbound.
+type FlowDirection int
 
 // Frame is an FFXIV bundled message encapsulation layer.
+// Currently, bytes 4:7, 8:15, 32, and 34:39 are unknown.
 type Frame struct {
-	Header   FrameHeader
-	Messages []Message
+	Magic      uint64    `json:"-"`              // [0:8] - mainly to verify magic bytes
+	Timestamp  time.Time `json:"-"`              // [16:24] - timestamp in milliseconds since epoch
+	Length     uint32    `json:"size"`           // [24:28]
+	Connection uint16    `json:"connectionType"` // [28:30] - 0 lobby, 1 zone, 2 chat
+	Count      uint16    `json:"count"`          // [30:32]
+	reserved1  byte      // [32]
+	Compressed bool      `json:"compressed"` // [33] UINT8 bool tho
+	reserved2  uint32    // [34:38]
+	reserved3  uint16    // [38:40]
+	Body       []byte    `json:"-"`
+
+	meta FrameMeta
 }
 
-// ToMap provides a hash representation of a frame header.
-func (h *FrameHeader) ToMap() map[string]interface{} {
-	data := make(map[string]interface{})
-
-	data["count"] = h.Count
-	data["compressed"] = h.Compressed
-	data["connection"] = h.Connection
-	data["length"] = h.Length
-	data["magic"] = h.Magic
-	data["timestamp"] = h.Timestamp
-
-	return data
+// FrameMeta represents metadata from the IP and TCP layers on the Frame.
+type FrameMeta struct {
+	Flow gopacket.Flow
 }
 
-// ToString provides a string representation of a frame header.
-func (h *FrameHeader) ToString() string {
-	return fmt.Sprintf("Frame - magic: 0x%X, timestamp: %v, length: %v, count: %v, compressed: %t, connection: %v",
-		h.Magic, h.Timestamp, h.Length, h.Count, h.Compressed, h.Connection)
-}
-
-func (h *FrameHeader) buildFrameData(p []byte) ([]byte, error) {
-	if h.Compressed {
-		// ZLIB a dumb and needs to read from a fixed size buffer or it just dies in the butt
-		buf := bytes.NewReader(p[frameHeaderLength:h.Length])
-		z, err := zlib.NewReader(buf)
-		if err != nil {
-			return nil, fmt.Errorf("Error creating ZLIB decoder: %s", err)
-		}
-
-		defer z.Close()
-
-		body, err := ioutil.ReadAll(z)
-		if err != nil {
-			return nil, fmt.Errorf("Error decoding ZLIB data: %s", err)
-		}
-
-		return body, nil
-	}
-
-	// Compression decoder returns so no need for else, just send back the raw body and EOF
-	return p[frameHeaderLength:], nil
-}
-
-func buildFrameHeader(p []byte) FrameHeader {
-	// Build the Frame Header
-	header := FrameHeader{}
-
-	// Keep the magic
-	header.Magic = binary.LittleEndian.Uint64(p[0:8])
+// Decode a frame from byte data
+func (f *Frame) Decode(p []byte) {
+	// Keep the magic alive
+	f.Magic = binary.LittleEndian.Uint64(p[0:8])
 
 	// Time in Go is a bit weird, this basically turns it into an int64
 	msec := time.Duration(binary.LittleEndian.Uint64(p[16:24])) * time.Millisecond
-	header.Timestamp = time.Unix(0, 0).Add(msec)
+	f.Timestamp = time.Unix(0, 0).Add(msec)
 
 	// Remaining fields
-	header.Length = binary.LittleEndian.Uint32(p[24:28])
-	header.Connection = binary.LittleEndian.Uint16(p[28:30])
-	header.Compressed = p[33] != 0
-	header.Count = binary.LittleEndian.Uint16(p[30:32])
+	f.Length = binary.LittleEndian.Uint32(p[24:28])
+	f.Connection = binary.LittleEndian.Uint16(p[28:30])
+	f.Compressed = p[33] != 0
+	f.Count = binary.LittleEndian.Uint16(p[30:32])
 
-	return header
+	f.Body = p[frameHeaderLength:f.Length]
+}
+
+// Direction outputs if the Frame is inbound or outbound.
+func (f *Frame) Direction() FlowDirection {
+	src, dst := f.meta.Flow.Endpoints()
+	srcIP := net.ParseIP(src.String())
+	dstIP := net.ParseIP(dst.String())
+
+	// Check for inbound first since that's the majority
+	if isPrivate(dstIP) && !isPrivate(srcIP) {
+		return FrameIngress
+	}
+
+	// Next up, outbound
+	if isPrivate(srcIP) && !isPrivate(dstIP) {
+		return FrameEgress
+	}
+
+	// If we get here, wtf is up with the src and dst
+	return 0
+}
+
+// MarshalJSON provides an override for timestamp handling for encoding/JSON
+func (f *Frame) MarshalJSON() ([]byte, error) {
+	type Alias Frame
+	data := make([]int, len(f.Body))
+	for i, b := range f.Body {
+		data[i] = int(b)
+	}
+
+	return json.Marshal(&struct {
+		Data      []int `json:"data"`
+		Timestamp int32 `json:"timestamp"`
+		*Alias
+	}{
+		Data:      data,
+		Timestamp: int32(f.Timestamp.Unix()),
+		Alias:     (*Alias)(f),
+	})
+}
+
+// Meta returns the frame metadata, a gopacket.Flow
+// this allows the user to determine if a Frame is inbound or outbound.
+func (f *Frame) Meta() FrameMeta {
+	return f.meta
+}
+
+// String provides a string representation of a frame header.
+func (f *Frame) String() string {
+	return fmt.Sprintf("Frame - magic: 0x%X, timestamp: %v, size: %v, count: %v, compressed: %t, connection: %v",
+		f.Magic, f.Timestamp.Unix(), f.Length, f.Count, f.Compressed, f.Connection)
 }
 
 func discardUntilValid(r *bufio.Reader) error {
@@ -109,12 +131,22 @@ func discardUntilValid(r *bufio.Reader) error {
 	}
 }
 
+func isPrivate(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+
+	_, private24BitBlock, _ := net.ParseCIDR("10.0.0.0/8")
+	_, private20BitBlock, _ := net.ParseCIDR("172.16.0.0/12")
+	_, private16BitBlock, _ := net.ParseCIDR("192.168.0.0/16")
+
+	private := private24BitBlock.Contains(ip) || private20BitBlock.Contains(ip) || private16BitBlock.Contains(ip)
+
+	return private
+}
+
 func validateMagic(header []byte) bool {
 	magic := binary.LittleEndian.Uint64(header)
 
-	if magic != frameMagicLE {
-		return false
-	}
-
-	return true
+	return magic == frameMagicLE
 }
